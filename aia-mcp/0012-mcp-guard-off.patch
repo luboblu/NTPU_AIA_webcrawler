@@ -1,0 +1,319 @@
+From 1321543cd9908b3e4f2855633ad6edcf118cf28b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 12:48:31 +0000
+Subject: [PATCH] feat(mcp): turn the personal-data filter off; make it a
+ three-way setting
+
+The user decided to republish name lists, since they are public on the
+official sites. PERSONAL_DATA_GUARD is now "off" | "student-ids" | "all";
+re-running a source with the filter off restores withheld announcements.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ mcp/README.md                                 | 10 ++--
+ mcp/src/ingestion/adapters/html-news.ts       |  3 +-
+ .../ingestion/adapters/strapi-publications.ts |  4 +-
+ mcp/src/ingestion/personal-data.ts            | 11 +++-
+ mcp/src/ingestion/source-registry.ts          | 15 +++--
+ mcp/src/ingestion/types.ts                    | 13 +++--
+ mcp/tests/integration/html-sources.test.ts    | 11 +++-
+ mcp/tests/integration/multi-office.test.ts    | 56 ++++++++++++-------
+ mcp/tests/unit/personal-data.test.ts          |  5 ++
+ 9 files changed, 85 insertions(+), 43 deletions(-)
+
+diff --git a/mcp/README.md b/mcp/README.md
+index a6e50f3..ec3614c 100644
+--- a/mcp/README.md
++++ b/mcp/README.md
+@@ -110,11 +110,13 @@ npx wrangler r2 bucket create ntpu-aia-raw-staging
+     語言中心約 434 則，第一次要分 8 次左右才抓完，這段期間 `/health` 會顯示 degraded。
+   - 每個請求間隔 1 秒；只允許登記的列表／內文路徑，內文編號必須符合固定格式（`queryRules`）。
+   - 日期是官網上的台灣日期，存成當天 00:00（UTC+8）。
+-  - **個人資料**（`src/ingestion/personal-data.ts`，全部 17 個公告來源都開啟）：名單類公告不收錄，記在 `quarantined_records`
++  - **個人資料**（`src/ingestion/personal-data.ts`）：**目前關閉**（使用者 2026-10-03 決定全部放行，官網本來就公開）。
++    `source-registry.ts` 的 `PERSONAL_DATA_GUARD` 可改成 `"student-ids"`（只擋含 3 個以上學號的名單）或 `"all"`。
++    開啟時名單類公告不收錄，記在 `quarantined_records`
+     （原因 `PERSONAL_DATA`），保留原始檔可追溯；不算驗證失敗，也不會每天重抓。判斷規則：
+-    遮罩姓名（O、○、〇、＊、x 等，排除「二〇二六」這類中文數字）、完整或部分遮罩的學號、
+-    標題像名單／結果公告且內文有 10 個以上像姓名的項目。已收錄的公告若重新驗證時被擋下，
+-    狀態改為 `withheld`，MCP 不再提供（不刪除）。
++    遮罩姓名（O、○、〇、＊ 等，排除「二〇二六」這類中文數字）、完整或部分遮罩的學號、
++    標題像名單／結果公告且內文有 10 個以上像姓名的項目，或 3 行以上「一行一人」的名單。已收錄的公告若重新驗證時被擋下，
++    狀態改為 `withheld`，MCP 不再提供（不刪除）；關閉過濾後重跑（語言中心、圖書館用 reverify）就會恢復。
+   - 規則更新後要重新檢查已收錄的公告：本機打
+     `/__scheduled?cron=reverify:lc-announcements:<規則更新的 UTC 時間，例如 2026-10-03T10:25:00Z>`，
+     每次 60 則，用同一個時間重複執行到 deferred 為 0。
+diff --git a/mcp/src/ingestion/adapters/html-news.ts b/mcp/src/ingestion/adapters/html-news.ts
+index e994879..a56f1b2 100644
+--- a/mcp/src/ingestion/adapters/html-news.ts
++++ b/mcp/src/ingestion/adapters/html-news.ts
+@@ -59,7 +59,8 @@ function detailStep(source: SourceDefinition, site: HtmlSite, config: HtmlNewsCo
+       const detail = site.parseDetail(decodeUtf8(bytes), item.id);
+       const text = bodyText(detail.bodyHtml);
+       const outcome: StepOutcome = { parsed: 1, records: [], rejected: [], skipped: 0 };
+-      const privacy = config.personalDataGuard ? personalDataReason(detail.title, text) : null;
++      const guard = config.personalDataGuard;
++      const privacy = guard === "off" ? null : personalDataReason(detail.title, text, guard);
+       if (privacy) {
+         outcome.rejected.push({ id: item.id, reason: privacy, countsTowardDrift: false });
+         return outcome;
+diff --git a/mcp/src/ingestion/adapters/strapi-publications.ts b/mcp/src/ingestion/adapters/strapi-publications.ts
+index fc52738..6c2debc 100644
+--- a/mcp/src/ingestion/adapters/strapi-publications.ts
++++ b/mcp/src/ingestion/adapters/strapi-publications.ts
+@@ -35,8 +35,8 @@ function pageStep(source: SourceDefinition, page: number, nowIso: string): Step
+           rejected.push({ id: rejectKey(row, page, index), reason: safeMessage(err), countsTowardDrift: true });
+           return;
+         }
+-        const guard = source.adapter.kind === "strapi-publications" && source.adapter.personalDataGuard;
+-        const privacy = guard ? personalDataReason(a.title, a.bodyText) : null;
++        const guard = source.adapter.kind === "strapi-publications" ? source.adapter.personalDataGuard : "off";
++        const privacy = guard === "off" ? null : personalDataReason(a.title, a.bodyText, guard);
+         if (privacy) {
+           rejected.push({ id: a.id, reason: privacy, countsTowardDrift: false });
+           return;
+diff --git a/mcp/src/ingestion/personal-data.ts b/mcp/src/ingestion/personal-data.ts
+index 506f92c..0fe19ba 100644
+--- a/mcp/src/ingestion/personal-data.ts
++++ b/mcp/src/ingestion/personal-data.ts
+@@ -1,3 +1,5 @@
++import type { PersonalDataGuard } from "./types";
++
+ /**
+  * 個人資料偵測：公告內文若是學生名單（遮罩或未遮罩的姓名、學號），MCP 不轉載，
+  * 改記隔離區（原因 PERSONAL_DATA），保留官網連結與原始檔可追溯。
+@@ -72,7 +74,11 @@ function rosterLines(text: string): number {
+   return names.size;
+ }
+ 
+-export function personalDataReason(title: string, text: string): string | null {
++export function personalDataReason(
++  title: string,
++  text: string,
++  mode: Exclude<PersonalDataGuard, "off"> = "all",
++): string | null {
+   const all = `${title}\n${text}`;
+   const masked = maskedNames(all);
+   const ids = new Set([...(all.match(FULL_STUDENT_ID) ?? []), ...(all.match(MASKED_STUDENT_ID) ?? [])]).size;
+@@ -80,8 +86,9 @@ export function personalDataReason(title: string, text: string): string | null {
+   const plain = listTitle ? plainNames(text) : 0;
+   const roster = listTitle ? rosterLines(text) : 0;
+   const hits: string[] = [];
+-  if (masked >= 3 || (masked >= 1 && listTitle)) hits.push(`${masked} masked name(s)`);
+   if (ids >= 3) hits.push(`${ids} student id(s)`);
++  if (mode === "student-ids") return hits.length ? `PERSONAL_DATA: ${hits.join(", ")}; not republished` : null;
++  if (masked >= 3 || (masked >= 1 && listTitle)) hits.push(`${masked} masked name(s)`);
+   if (plain >= 10) hits.push(`${plain} name-like entries under a list title`);
+   if (roster >= 3) hits.push(`${roster} one-name-per-line entries under a list title`);
+   return hits.length ? `PERSONAL_DATA: ${hits.join(", ")}; not republished` : null;
+diff --git a/mcp/src/ingestion/source-registry.ts b/mcp/src/ingestion/source-registry.ts
+index f1da4c5..dae87f8 100644
+--- a/mcp/src/ingestion/source-registry.ts
++++ b/mcp/src/ingestion/source-registry.ts
+@@ -1,5 +1,5 @@
+ import { validateSourceDefinition } from "./url-policy";
+-import type { FetchPolicy, SourceDefinition } from "./types";
++import type { FetchPolicy, PersonalDataGuard, SourceDefinition } from "./types";
+ 
+ const USER_AGENT = "NTPU-AIA-Ingestion/0.1 (+https://aia.ntpu.ai/about)";
+ 
+@@ -27,10 +27,10 @@ const HTML_FETCH: FetchPolicy = {
+ };
+ 
+ /**
+- * new.ntpu.edu.tw 各處室公告也套用個資過濾（使用者 2026-10-03 決定：學生與教職員名單都不轉載，
+- * 只留官網連結）。開啟時掃描約 73 則會被擋。
++ * 全部公告來源的個資過濾模式。使用者 2026-10-03 決定全部放行（官網本來就公開）。
++ * 改成 "student-ids" 只擋含學號的名單（掃描約 13 則），"all" 連姓名名單也擋（約 77 則）。
+  */
+-const STRAPI_PERSONAL_DATA_GUARD = true;
++const PERSONAL_DATA_GUARD: PersonalDataGuard = "off";
+ 
+ const DAILY = { schedule: "daily", maxStalenessSeconds: 48 * 60 * 60 };
+ 
+@@ -115,7 +115,7 @@ export const SOURCES: readonly SourceDefinition[] = [
+       newsUrlBase: base,
+       ...strapiOrigin,
+       parser: "strapi-publications",
+-      adapter: { kind: "strapi-publications", siteKey, personalDataGuard: STRAPI_PERSONAL_DATA_GUARD },
++      adapter: { kind: "strapi-publications", siteKey, personalDataGuard: PERSONAL_DATA_GUARD },
+       entityType: "announcement",
+       enabled: true,
+       fetch: STRAPI_FETCH,
+@@ -163,7 +163,7 @@ export const SOURCES: readonly SourceDefinition[] = [
+       site: "library-ewpt",
+       maxDetailsPerRun: 60,
+       reverifyAfterSeconds: 7 * 86_400,
+-      personalDataGuard: true,
++      personalDataGuard: PERSONAL_DATA_GUARD,
+     },
+     entityType: "announcement",
+     enabled: true,
+@@ -172,7 +172,6 @@ export const SOURCES: readonly SourceDefinition[] = [
+   },
+   {
+     // 語言中心自己的網站。最新消息約 434 則（6 則一頁），內文分批抓。
+-    // 部分公告是學生名單（遮罩姓名），依 personalDataGuard 不收錄。
+     id: "lc-announcements",
+     sourceUnit: "lc",
+     sourceType: "official_web",
+@@ -192,7 +191,7 @@ export const SOURCES: readonly SourceDefinition[] = [
+       site: "lc-jsp",
+       maxDetailsPerRun: 60,
+       reverifyAfterSeconds: 7 * 86_400,
+-      personalDataGuard: true,
++      personalDataGuard: PERSONAL_DATA_GUARD,
+     },
+     entityType: "announcement",
+     enabled: true,
+diff --git a/mcp/src/ingestion/types.ts b/mcp/src/ingestion/types.ts
+index 4d553b1..2af525c 100644
+--- a/mcp/src/ingestion/types.ts
++++ b/mcp/src/ingestion/types.ts
+@@ -16,6 +16,11 @@ export interface FetchPolicy {
+ }
+ 
+ /** 某個 entrypoint 允許的查詢參數，每個參數都必須完全符合對應的格式。 */
++/**
++ * 個資過濾模式：off 全部收錄；student-ids 只擋含學號的名單；all 連姓名名單也擋。
++ */
++export type PersonalDataGuard = "off" | "student-ids" | "all";
++
+ export type QueryRules = Record<string, Record<string, RegExp>>;
+ 
+ /** 學校 Strapi 公告（new.ntpu.edu.tw 的處室公告）。 */
+@@ -23,8 +28,8 @@ export interface StrapiPublicationsConfig {
+   kind: "strapi-publications";
+   /** sitesApproved 的值，例如研發處為 ord_ntpu。 */
+   siteKey: string;
+-  /** 疑似含個人資料（學生名單、學號）的公告不收錄，記入隔離區。 */
+-  personalDataGuard: boolean;
++  /** 疑似含個人資料的公告不收錄，記入隔離區（見 PersonalDataGuard）。 */
++  personalDataGuard: PersonalDataGuard;
+ }
+ 
+ /** 學校 Strapi 的固定內容頁（sections），以頁面路徑指定。 */
+@@ -42,8 +47,8 @@ export interface HtmlNewsConfig {
+   maxDetailsPerRun: number;
+   /** 內文多久沒重新驗證就要重抓。 */
+   reverifyAfterSeconds: number;
+-  /** 疑似含個人資料（遮罩姓名名單）的公告不收錄，記入隔離區。 */
+-  personalDataGuard: boolean;
++  /** 疑似含個人資料的公告不收錄，記入隔離區（見 PersonalDataGuard）。 */
++  personalDataGuard: PersonalDataGuard;
+ }
+ 
+ export type AdapterConfig = StrapiPublicationsConfig | StrapiSectionsConfig | HtmlNewsConfig;
+diff --git a/mcp/tests/integration/html-sources.test.ts b/mcp/tests/integration/html-sources.test.ts
+index 9414a77..e5eaf08 100644
+--- a/mcp/tests/integration/html-sources.test.ts
++++ b/mcp/tests/integration/html-sources.test.ts
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it } from "vitest";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
+ import { CanonicalStore } from "../../src/db/canonical-store";
+ import { fetchSource } from "../../src/ingestion/fetch-source";
+ import { pickDueSource, runIngestion, type IngestionDeps } from "../../src/ingestion/run-ingestion";
+@@ -138,6 +138,15 @@ describe("library.ntpu.edu.tw", () => {
+ });
+ 
+ describe("lc.ntpu.edu.tw", () => {
++  // 個資過濾預設關閉；這裡開啟來驗證過濾開啟時的行為。
++  const lcAdapter = getSource("lc-announcements")!.adapter;
++  beforeEach(() => {
++    if (lcAdapter.kind === "html-news") lcAdapter.personalDataGuard = "all";
++  });
++  afterEach(() => {
++    if (lcAdapter.kind === "html-news") lcAdapter.personalDataGuard = "off";
++  });
++
+   it("backfills a long archive over several runs and is picked again before other offices", async () => {
+     sites.lc = Array.from({ length: 130 }, (_, i) => lcNews(i + 1));
+     const first = await runLc();
+diff --git a/mcp/tests/integration/multi-office.test.ts b/mcp/tests/integration/multi-office.test.ts
+index 5fd6fdc..7eb1db2 100644
+--- a/mcp/tests/integration/multi-office.test.ts
++++ b/mcp/tests/integration/multi-office.test.ts
+@@ -77,29 +77,43 @@ describe("all offices", () => {
+     }
+   });
+ 
+-  it("the personal-data guard is on for every office and withholds already-published lists", async () => {
++  it("the personal-data guard is off by default; turning it off again releases withheld lists", async () => {
+     const { getSource } = await import("../../src/ingestion/source-registry");
+     const osa = getSource("osa-announcements")!;
+-    if (osa.adapter.kind !== "strapi-publications") throw new Error("unexpected adapter");
+-    expect(osa.adapter.personalDataGuard).toBe(true);
+-    const list = publication(2, { title: "宿舍續住資格結果", content: "<p>411234567 412345678 410987654</p>" });
+-    deps.fetch = new FakeStrapi([], { osa_ntpu: [publication(1), list] }).fetch;
+-    // 模擬過濾開啟前已經收錄的情況。
+-    osa.adapter.personalDataGuard = false;
+-    try {
+-      await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
+-    } finally {
+-      osa.adapter.personalDataGuard = true;
+-    }
+-    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([{ status: "active" }]);
+-    clock.advance(86_400);
+-    const summary = await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
+-    expect(summary).toMatchObject({ status: "success", quarantined: 1, failed: 0 });
+-    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([
+-      { status: "withheld" },
+-    ]);
+-    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${publication(1)._id}'`)).toEqual([
+-      { status: "active" },
++    const adapter = osa.adapter;
++    if (adapter.kind !== "strapi-publications") throw new Error("unexpected adapter");
++    expect(adapter.personalDataGuard).toBe("off");
++    const ids = publication(2, { title: "宿舍續住資格結果", content: "<p>411234567 412345678 410987654</p>" });
++    const masked = publication(3, { title: "徵文比賽得獎名單", content: "<p>王〇明 李〇華 陳〇安</p>" });
++    deps.fetch = new FakeStrapi([], { osa_ntpu: [publication(1), ids, masked] }).fetch;
++    const status = (p: { _id: string }) =>
++      db.rows<{ status: string }>(`SELECT status FROM entities WHERE stable_key = 'osa:${p._id}'`).map((r) => r.status);
++
++    const runWith = async (mode: "off" | "student-ids" | "all") => {
++      adapter.personalDataGuard = mode;
++      try {
++        clock.advance(86_400);
++        return await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
++      } finally {
++        adapter.personalDataGuard = "off";
++      }
++    };
++
++    await runWith("off");
++    expect([status(ids), status(masked)]).toEqual([["active"], ["active"]]);
++
++    expect(await runWith("all")).toMatchObject({ status: "success", quarantined: 2, failed: 0 });
++    expect([status(ids), status(masked)]).toEqual([["withheld"], ["withheld"]]);
++
++    // 只擋學號：遮罩姓名的名單恢復，含學號的仍擋。
++    expect(await runWith("student-ids")).toMatchObject({ status: "success", quarantined: 1, failed: 0 });
++    expect([status(ids), status(masked)]).toEqual([["withheld"], ["active"]]);
++
++    // 關閉過濾：全部恢復，MCP 可以查到。
++    expect(await runWith("off")).toMatchObject({ status: "success", quarantined: 0, failed: 0 });
++    expect([status(ids), status(masked), status(publication(1))]).toEqual([["active"], ["active"], ["active"]]);
++    expect(db.rows(`SELECT COUNT(*) AS n FROM quarantined_records WHERE source_id = 'osa-announcements'`)).toEqual([
++      { n: 0 },
+     ]);
+   });
+ 
+diff --git a/mcp/tests/unit/personal-data.test.ts b/mcp/tests/unit/personal-data.test.ts
+index 8a16891..4e7a4ec 100644
+--- a/mcp/tests/unit/personal-data.test.ts
++++ b/mcp/tests/unit/personal-data.test.ts
+@@ -49,4 +49,9 @@ describe("personal data guard", () => {
+   ])("does not block %s", (_name, title, text) => {
+     expect(personalDataReason(title, text)).toBeNull();
+   });
++
++  it("student-ids mode blocks only student id lists", () => {
++    expect(personalDataReason("問卷抽獎結果", "411234567 412345678 410987654", "student-ids")).toMatch(/student id/);
++    expect(personalDataReason("合格名單", "王〇明 李〇華 陳〇安", "student-ids")).toBeNull();
++  });
+ });
+-- 
+2.43.0
+
