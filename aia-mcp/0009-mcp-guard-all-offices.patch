@@ -1,0 +1,111 @@
+From 4523e2cba91c07ac8e247720fc7d7d230eefed19 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 12:33:09 +0000
+Subject: [PATCH] feat(mcp): turn on the personal-data filter for all strapi
+ offices
+
+Student and staff name lists on new.ntpu.edu.tw are no longer republished;
+only the official link remains. Already-published lists become withheld on
+the next run.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ mcp/README.md                              |  2 +-
+ mcp/src/ingestion/source-registry.ts       |  8 ++++--
+ mcp/tests/integration/multi-office.test.ts | 33 +++++++++++-----------
+ 3 files changed, 23 insertions(+), 20 deletions(-)
+
+diff --git a/mcp/README.md b/mcp/README.md
+index 6b0f8cd..a6e50f3 100644
+--- a/mcp/README.md
++++ b/mcp/README.md
+@@ -110,7 +110,7 @@ npx wrangler r2 bucket create ntpu-aia-raw-staging
+     語言中心約 434 則，第一次要分 8 次左右才抓完，這段期間 `/health` 會顯示 degraded。
+   - 每個請求間隔 1 秒；只允許登記的列表／內文路徑，內文編號必須符合固定格式（`queryRules`）。
+   - 日期是官網上的台灣日期，存成當天 00:00（UTC+8）。
+-  - **個人資料**（`src/ingestion/personal-data.ts`）：學生名單類公告不收錄，記在 `quarantined_records`
++  - **個人資料**（`src/ingestion/personal-data.ts`，全部 17 個公告來源都開啟）：名單類公告不收錄，記在 `quarantined_records`
+     （原因 `PERSONAL_DATA`），保留原始檔可追溯；不算驗證失敗，也不會每天重抓。判斷規則：
+     遮罩姓名（O、○、〇、＊、x 等，排除「二〇二六」這類中文數字）、完整或部分遮罩的學號、
+     標題像名單／結果公告且內文有 10 個以上像姓名的項目。已收錄的公告若重新驗證時被擋下，
+diff --git a/mcp/src/ingestion/source-registry.ts b/mcp/src/ingestion/source-registry.ts
+index c63f2ff..f1da4c5 100644
+--- a/mcp/src/ingestion/source-registry.ts
++++ b/mcp/src/ingestion/source-registry.ts
+@@ -26,8 +26,11 @@ const HTML_FETCH: FetchPolicy = {
+   minIntervalMs: 1_000,
+ };
+ 
+-/** new.ntpu.edu.tw 各處室公告是否套用個資過濾。 */
+-const STRAPI_PERSONAL_DATA_GUARD = false;
++/**
++ * new.ntpu.edu.tw 各處室公告也套用個資過濾（使用者 2026-10-03 決定：學生與教職員名單都不轉載，
++ * 只留官網連結）。開啟時掃描約 73 則會被擋。
++ */
++const STRAPI_PERSONAL_DATA_GUARD = true;
+ 
+ const DAILY = { schedule: "daily", maxStalenessSeconds: 48 * 60 * 60 };
+ 
+@@ -112,7 +115,6 @@ export const SOURCES: readonly SourceDefinition[] = [
+       newsUrlBase: base,
+       ...strapiOrigin,
+       parser: "strapi-publications",
+-      // 其他 15 個處室的個資過濾待使用者決定（2026-10-03 掃描：73 則會被擋，含教職員名單）。
+       adapter: { kind: "strapi-publications", siteKey, personalDataGuard: STRAPI_PERSONAL_DATA_GUARD },
+       entityType: "announcement",
+       enabled: true,
+diff --git a/mcp/tests/integration/multi-office.test.ts b/mcp/tests/integration/multi-office.test.ts
+index 79ec915..5fd6fdc 100644
+--- a/mcp/tests/integration/multi-office.test.ts
++++ b/mcp/tests/integration/multi-office.test.ts
+@@ -77,29 +77,30 @@ describe("all offices", () => {
+     }
+   });
+ 
+-  it("the personal-data guard can be switched on per office and withholds already-published lists", async () => {
++  it("the personal-data guard is on for every office and withholds already-published lists", async () => {
+     const { getSource } = await import("../../src/ingestion/source-registry");
+     const osa = getSource("osa-announcements")!;
++    if (osa.adapter.kind !== "strapi-publications") throw new Error("unexpected adapter");
++    expect(osa.adapter.personalDataGuard).toBe(true);
+     const list = publication(2, { title: "宿舍續住資格結果", content: "<p>411234567 412345678 410987654</p>" });
+     deps.fetch = new FakeStrapi([], { osa_ntpu: [publication(1), list] }).fetch;
+-    await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
+-    expect(db.rows("SELECT status FROM entities WHERE stable_key LIKE 'osa:%' ORDER BY stable_key")).toEqual([
+-      { status: "active" },
+-      { status: "active" },
+-    ]);
+-    if (osa.adapter.kind !== "strapi-publications") throw new Error("unexpected adapter");
+-    const before = osa.adapter.personalDataGuard;
+-    osa.adapter.personalDataGuard = true;
++    // 模擬過濾開啟前已經收錄的情況。
++    osa.adapter.personalDataGuard = false;
+     try {
+-      clock.advance(86_400);
+-      const summary = await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
+-      expect(summary).toMatchObject({ status: "success", quarantined: 1, failed: 0 });
+-      expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([
+-        { status: "withheld" },
+-      ]);
++      await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
+     } finally {
+-      osa.adapter.personalDataGuard = before;
++      osa.adapter.personalDataGuard = true;
+     }
++    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([{ status: "active" }]);
++    clock.advance(86_400);
++    const summary = await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
++    expect(summary).toMatchObject({ status: "success", quarantined: 1, failed: 0 });
++    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([
++      { status: "withheld" },
++    ]);
++    expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${publication(1)._id}'`)).toEqual([
++      { status: "active" },
++    ]);
+   });
+ 
+   it("an office with no announcements completes successfully with zero records", async () => {
+-- 
+2.43.0
+
