@@ -1,0 +1,94 @@
+From 7ff97691078cedffbe1144049ebdd41e091f633d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 12:42:11 +0000
+Subject: [PATCH] =?UTF-8?q?fix(mcp):=20block=20winner=20and=20teacher=20li?=
+ =?UTF-8?q?sts=20written=20as=20"name=20=E5=90=8C=E5=AD=B8/=E8=80=81?=
+ =?UTF-8?q?=E5=B8=AB"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Under a list title, three or more surname-led names followed by 同學, 老師
+or 教授 now count as a name list. Adds 獲選 to the list-title words.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ mcp/src/ingestion/personal-data.ts   | 18 +++++++++++++++++-
+ mcp/tests/unit/personal-data.test.ts |  8 ++++++++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/mcp/src/ingestion/personal-data.ts b/mcp/src/ingestion/personal-data.ts
+index 660711b..7a45d22 100644
+--- a/mcp/src/ingestion/personal-data.ts
++++ b/mcp/src/ingestion/personal-data.ts
+@@ -17,7 +17,7 @@ const FULL_STUDENT_ID = /(?<![\w.-])[34]\d{8}(?![\w.-])/g;
+ /** 部分遮罩學號，例如 4xx***xxx、41234****。 */
+ const MASKED_STUDENT_ID = /(?<![\dA-Za-z])[34][\dxX]{1,5}[*＊]{2,}[\dxX]*(?![\dA-Za-z])/g;
+ /** 標題像名單或結果公告。 */
+-const LIST_TITLE = /名單|獲獎|得獎|得主|合格|錄取|錄取|抽獎|中獎|結果|榜單|獎勵/;
++const LIST_TITLE = /名單|獲獎|得獎|得主|合格|錄取|抽獎|中獎|結果|榜單|獎勵|獲選/;
+ 
+ /** 常見姓氏（約涵蓋台灣九成以上人口）。 */
+ const SURNAMES = new Set(
+@@ -46,15 +46,31 @@ function plainNames(text: string): number {
+   return names.size;
+ }
+ 
++/** 名單另一種排法：「系所 姓名 同學」「姓名 老師」，姓名後面直接接稱謂。 */
++const TITLED_NAME = new RegExp(`([${CJK}]{2,4})[ \\t\\u3000]*(?:同學|老師|教授)`, "g");
++
++function titledNames(text: string): number {
++  const names = new Set<string>();
++  for (const m of text.matchAll(TITLED_NAME)) {
++    const before = m[1]!;
++    // 姓名 2–3 個字、以常見姓氏開頭；前面可能黏著系所名稱。
++    const name = [before.slice(-3), before.slice(-2)].find((n) => n.length >= 2 && SURNAMES.has(n[0]!));
++    if (name) names.add(name);
++  }
++  return names.size;
++}
++
+ export function personalDataReason(title: string, text: string): string | null {
+   const all = `${title}\n${text}`;
+   const masked = maskedNames(all);
+   const ids = new Set([...(all.match(FULL_STUDENT_ID) ?? []), ...(all.match(MASKED_STUDENT_ID) ?? [])]).size;
+   const listTitle = LIST_TITLE.test(title);
+   const plain = listTitle ? plainNames(text) : 0;
++  const titled = listTitle ? titledNames(text) : 0;
+   const hits: string[] = [];
+   if (masked >= 3 || (masked >= 1 && listTitle)) hits.push(`${masked} masked name(s)`);
+   if (ids >= 3) hits.push(`${ids} student id(s)`);
+   if (plain >= 10) hits.push(`${plain} name-like entries under a list title`);
++  if (titled >= 3) hits.push(`${titled} names followed by 同學/老師/教授 under a list title`);
+   return hits.length ? `PERSONAL_DATA: ${hits.join(", ")}; not republished` : null;
+ }
+diff --git a/mcp/tests/unit/personal-data.test.ts b/mcp/tests/unit/personal-data.test.ts
+index 8576aea..9b515a6 100644
+--- a/mcp/tests/unit/personal-data.test.ts
++++ b/mcp/tests/unit/personal-data.test.ts
+@@ -13,6 +13,12 @@ describe("personal data guard", () => {
+       "EMI/ESAP教學助理合格名單",
+       "陳怡君 林家豪 黃志明 張雅婷 李宗翰 王淑芬 吳承恩 劉建宏 蔡佳穎 楊子儀 許文彬",
+     ],
++    [
++      "student names followed by 同學",
++      "【得獎名單】通識月徵件競賽評審結果",
++      "第一名 法律學系 陳怡君 同學\n第二名 經濟學系林家豪同學\n佳作 社工系 黃志明 同學",
++    ],
++    ["teacher names followed by 老師", "獲選優良通識教育教師名單", "張雅婷 老師、李宗翰老師、王淑芬 教授"],
+   ])("blocks %s", (_name, title, text) => {
+     expect(personalDataReason(title, text)).toMatch(/^PERSONAL_DATA/);
+   });
+@@ -24,6 +30,8 @@ describe("personal data guard", () => {
+     ["phone numbers and dates", "多益校園考報名", "電話 02-86741111 分機 66701，日期 2026/10/03。"],
+     ["numbers inside image file names", "培力講座", "S__412345678.jpg 412345679_n.jpg img-412345670.png"],
+     ["x used as a connector or in X光", "活動轉知", "育X臺交流、講x國際論壇、用X光檢查、陳x林合作"],
++    ["同學/老師 without names", "得獎名單公告", "恭喜全體同學，感謝各位老師與指導教授協助。"],
++    ["titled names without a list title", "講座資訊", "主講：陳怡君老師、林家豪教授、黃志明老師"],
+   ])("does not block %s", (_name, title, text) => {
+     expect(personalDataReason(title, text)).toBeNull();
+   });
+-- 
+2.43.0
+
