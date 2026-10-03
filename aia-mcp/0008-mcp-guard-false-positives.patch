@@ -1,0 +1,198 @@
+From 735c1d54614938a8e46be4ce37becafc0db4c51c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 12:30:43 +0000
+Subject: [PATCH] fix(mcp): drop two false-positive patterns; add an opt-in
+ guard for strapi offices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A read-only scan of all 6,800 local records found the detector counting
+9-digit numbers inside image file names as student ids, and x/X used as
+a connector or in X光 as name masks. Ids now need non-word boundaries and
+x/X is no longer a mask character (no real list used it).
+
+Strapi offices get the same personalDataGuard switch as the HTML sites,
+off for now: turning it on would withhold 73 posts across 11 offices,
+some of which list staff or elected faculty rather than students.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ .../ingestion/adapters/strapi-publications.ts | 27 ++++++++++++-------
+ mcp/src/ingestion/personal-data.ts            | 11 +++++---
+ mcp/src/ingestion/source-registry.ts          |  6 ++++-
+ mcp/src/ingestion/types.ts                    |  2 ++
+ mcp/tests/integration/multi-office.test.ts    | 25 +++++++++++++++++
+ mcp/tests/unit/personal-data.test.ts          |  3 ++-
+ 6 files changed, 59 insertions(+), 15 deletions(-)
+
+diff --git a/mcp/src/ingestion/adapters/strapi-publications.ts b/mcp/src/ingestion/adapters/strapi-publications.ts
+index efb9586..fc52738 100644
+--- a/mcp/src/ingestion/adapters/strapi-publications.ts
++++ b/mcp/src/ingestion/adapters/strapi-publications.ts
+@@ -1,5 +1,6 @@
+ import { IngestionError, safeMessage } from "../../shared/errors";
+ import { normalizeAnnouncement } from "../normalizers/announcement.normalizer";
++import { personalDataReason } from "../personal-data";
+ import { strapiPublicationsParser as parser, type StrapiPublication } from "../parsers/strapi-publications.parser";
+ import type { SourceDefinition } from "../types";
+ import type { Adapter, AdapterRecord, RejectedRecord, Step } from "./types";
+@@ -27,19 +28,27 @@ function pageStep(source: SourceDefinition, page: number, nowIso: string): Step
+           skipped++;
+           return;
+         }
++        let a;
+         try {
+-          const a = normalizeAnnouncement(row, source);
+-          records.push({
+-            id: a.id,
+-            payload: a,
+-            title: a.title,
+-            searchText: [a.title, a.bodyText, ...a.attachments.map((f) => f.name)].join("\n"),
+-            sourceUrl: a.sourceUrl,
+-            publishedAt: a.publishedAt,
+-          });
++          a = normalizeAnnouncement(row, source);
+         } catch (err) {
+           rejected.push({ id: rejectKey(row, page, index), reason: safeMessage(err), countsTowardDrift: true });
++          return;
++        }
++        const guard = source.adapter.kind === "strapi-publications" && source.adapter.personalDataGuard;
++        const privacy = guard ? personalDataReason(a.title, a.bodyText) : null;
++        if (privacy) {
++          rejected.push({ id: a.id, reason: privacy, countsTowardDrift: false });
++          return;
+         }
++        records.push({
++          id: a.id,
++          payload: a,
++          title: a.title,
++          searchText: [a.title, a.bodyText, ...a.attachments.map((f) => f.name)].join("\n"),
++          sourceUrl: a.sourceUrl,
++          publishedAt: a.publishedAt,
++        });
+       });
+       const full = rows.length >= parser.pageSize;
+       return {
+diff --git a/mcp/src/ingestion/personal-data.ts b/mcp/src/ingestion/personal-data.ts
+index 2139543..660711b 100644
+--- a/mcp/src/ingestion/personal-data.ts
++++ b/mcp/src/ingestion/personal-data.ts
+@@ -5,12 +5,15 @@
+  */
+ 
+ const CJK = "\\u4e00-\\u9fff";
+-/** 遮罩字元：O、全形 Ｏ、○、◯、〇、＊、*、x、X。 */
+-const MASKED_NAME = new RegExp(`[${CJK}][OＯ○◯〇＊*xX][${CJK}]`, "g");
++/**
++ * 遮罩字元：O、全形 Ｏ、○、◯、〇、＊、*。不含 x/X：實際資料裡 x 多半是連接詞或「X光」，
++ * 2026-10-03 掃描全部公告沒有用 x 遮罩姓名的例子。
++ */
++const MASKED_NAME = new RegExp(`[${CJK}][OＯ○◯〇＊*][${CJK}]`, "g");
+ /** 「二〇二六」這類中文數字裡的〇不是遮罩。 */
+ const CHINESE_NUMERAL = /^[〇零一二三四五六七八九十百千]$/;
+-/** 完整學號（本校為 9 碼、以 3 或 4 開頭）。 */
+-const FULL_STUDENT_ID = /(?<!\d)[34]\d{8}(?!\d)/g;
++/** 完整學號（本校為 9 碼、以 3 或 4 開頭）。前後接英數、底線、點或連字號的不算（例如圖片檔名 S__412345678.jpg）。 */
++const FULL_STUDENT_ID = /(?<![\w.-])[34]\d{8}(?![\w.-])/g;
+ /** 部分遮罩學號，例如 4xx***xxx、41234****。 */
+ const MASKED_STUDENT_ID = /(?<![\dA-Za-z])[34][\dxX]{1,5}[*＊]{2,}[\dxX]*(?![\dA-Za-z])/g;
+ /** 標題像名單或結果公告。 */
+diff --git a/mcp/src/ingestion/source-registry.ts b/mcp/src/ingestion/source-registry.ts
+index 89a705e..c63f2ff 100644
+--- a/mcp/src/ingestion/source-registry.ts
++++ b/mcp/src/ingestion/source-registry.ts
+@@ -26,6 +26,9 @@ const HTML_FETCH: FetchPolicy = {
+   minIntervalMs: 1_000,
+ };
+ 
++/** new.ntpu.edu.tw 各處室公告是否套用個資過濾。 */
++const STRAPI_PERSONAL_DATA_GUARD = false;
++
+ const DAILY = { schedule: "daily", maxStalenessSeconds: 48 * 60 * 60 };
+ 
+ /** 處室代碼 → 中文名稱（MCP 工具說明與回應使用）。 */
+@@ -109,7 +112,8 @@ export const SOURCES: readonly SourceDefinition[] = [
+       newsUrlBase: base,
+       ...strapiOrigin,
+       parser: "strapi-publications",
+-      adapter: { kind: "strapi-publications", siteKey },
++      // 其他 15 個處室的個資過濾待使用者決定（2026-10-03 掃描：73 則會被擋，含教職員名單）。
++      adapter: { kind: "strapi-publications", siteKey, personalDataGuard: STRAPI_PERSONAL_DATA_GUARD },
+       entityType: "announcement",
+       enabled: true,
+       fetch: STRAPI_FETCH,
+diff --git a/mcp/src/ingestion/types.ts b/mcp/src/ingestion/types.ts
+index 0c11d24..4d553b1 100644
+--- a/mcp/src/ingestion/types.ts
++++ b/mcp/src/ingestion/types.ts
+@@ -23,6 +23,8 @@ export interface StrapiPublicationsConfig {
+   kind: "strapi-publications";
+   /** sitesApproved 的值，例如研發處為 ord_ntpu。 */
+   siteKey: string;
++  /** 疑似含個人資料（學生名單、學號）的公告不收錄，記入隔離區。 */
++  personalDataGuard: boolean;
+ }
+ 
+ /** 學校 Strapi 的固定內容頁（sections），以頁面路徑指定。 */
+diff --git a/mcp/tests/integration/multi-office.test.ts b/mcp/tests/integration/multi-office.test.ts
+index d071123..79ec915 100644
+--- a/mcp/tests/integration/multi-office.test.ts
++++ b/mcp/tests/integration/multi-office.test.ts
+@@ -77,6 +77,31 @@ describe("all offices", () => {
+     }
+   });
+ 
++  it("the personal-data guard can be switched on per office and withholds already-published lists", async () => {
++    const { getSource } = await import("../../src/ingestion/source-registry");
++    const osa = getSource("osa-announcements")!;
++    const list = publication(2, { title: "宿舍續住資格結果", content: "<p>411234567 412345678 410987654</p>" });
++    deps.fetch = new FakeStrapi([], { osa_ntpu: [publication(1), list] }).fetch;
++    await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
++    expect(db.rows("SELECT status FROM entities WHERE stable_key LIKE 'osa:%' ORDER BY stable_key")).toEqual([
++      { status: "active" },
++      { status: "active" },
++    ]);
++    if (osa.adapter.kind !== "strapi-publications") throw new Error("unexpected adapter");
++    const before = osa.adapter.personalDataGuard;
++    osa.adapter.personalDataGuard = true;
++    try {
++      clock.advance(86_400);
++      const summary = await runIngestion(deps, { sourceIds: ["osa-announcements"], trigger: "test" });
++      expect(summary).toMatchObject({ status: "success", quarantined: 1, failed: 0 });
++      expect(db.rows(`SELECT status FROM entities WHERE stable_key = 'osa:${list._id}'`)).toEqual([
++        { status: "withheld" },
++      ]);
++    } finally {
++      osa.adapter.personalDataGuard = before;
++    }
++  });
++
+   it("an office with no announcements completes successfully with zero records", async () => {
+     const summary = await runIngestion(deps, { sourceIds: ["cic-announcements"], trigger: "test" });
+     expect(summary).toMatchObject({ status: "success", fetched: 1, published: 0, failed: 0 });
+diff --git a/mcp/tests/unit/personal-data.test.ts b/mcp/tests/unit/personal-data.test.ts
+index 4bdd0d2..8576aea 100644
+--- a/mcp/tests/unit/personal-data.test.ts
++++ b/mcp/tests/unit/personal-data.test.ts
+@@ -6,7 +6,6 @@ describe("personal data guard", () => {
+     ["masked with O", "合格名單", "高O琁"],
+     ["masked with 〇", "英語能力檢定獎勵結果公告", "王〇明\t李〇華\t陳〇安"],
+     ["masked with ○ and no list title", "國際志工培訓招募", "錄取：林○宇、張○婷、黃○誠"],
+-    ["masked with x", "抽獎結果", "吳x豪 周x妤 蔡x勳"],
+     ["full student ids", "問卷抽獎結果", "411234567 412345678 410987654"],
+     ["partly masked student ids", "獲獎名單", "4xx***123\n41234****\n4101***88"],
+     [
+@@ -23,6 +22,8 @@ describe("personal data guard", () => {
+     ["ordinary announcements", "英文健診預約名單", "請至英文健診系統查詢預約時段，名單請見附件圖片。"],
+     ["name-like words without a list title", "課程介紹", "陳列 林園 黃金 張貼 李子 王牌 吳郭魚 劉海 蔡倫 楊柳 許多 高等"],
+     ["phone numbers and dates", "多益校園考報名", "電話 02-86741111 分機 66701，日期 2026/10/03。"],
++    ["numbers inside image file names", "培力講座", "S__412345678.jpg 412345679_n.jpg img-412345670.png"],
++    ["x used as a connector or in X光", "活動轉知", "育X臺交流、講x國際論壇、用X光檢查、陳x林合作"],
+   ])("does not block %s", (_name, title, text) => {
+     expect(personalDataReason(title, text)).toBeNull();
+   });
+-- 
+2.43.0
+
