@@ -1,0 +1,436 @@
+From 02593bc48a6c426d503dc164bcfdf584b868feec Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 10:23:58 +0000
+Subject: [PATCH] fix(mcp): catch the student name lists the language-center
+ filter missed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The real run found 8 language-center posts with student names that were
+published: six used 〇 as the mask character, two listed full names
+without masking. The detector now also covers 〇 (but not in Chinese
+numerals like 二〇二六), x/X masks, full and partly masked student ids,
+and unmasked name lists under list-like titles.
+
+A record that was published but is rejected on re-verification is now
+set to 'withheld' and no longer served, and the daily list walk does not
+reactivate it. A local reverify:<source> trigger re-checks every stored
+detail in batches after rule changes. Also decode &times; and other
+common HTML entities.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ mcp/README.md                              |  9 +++-
+ mcp/src/db/canonical-store.ts              | 23 ++++++++-
+ mcp/src/db/read-repository.ts              |  2 +-
+ mcp/src/ingestion/adapters/html-news.ts    | 20 ++------
+ mcp/src/ingestion/adapters/types.ts        |  2 +
+ mcp/src/ingestion/html-text.ts             | 26 ++++++++++
+ mcp/src/ingestion/index.ts                 | 12 +++--
+ mcp/src/ingestion/personal-data.ts         | 57 ++++++++++++++++++++++
+ mcp/src/ingestion/run-ingestion.ts         | 19 +++++++-
+ mcp/tests/integration/html-sources.test.ts | 23 +++++++++
+ mcp/tests/unit/personal-data.test.ts       | 29 +++++++++++
+ 11 files changed, 197 insertions(+), 25 deletions(-)
+ create mode 100644 mcp/src/ingestion/personal-data.ts
+ create mode 100644 mcp/tests/unit/personal-data.test.ts
+
+diff --git a/mcp/README.md b/mcp/README.md
+index 9de98e9..89d98c3 100644
+--- a/mcp/README.md
++++ b/mcp/README.md
+@@ -110,8 +110,13 @@ npx wrangler r2 bucket create ntpu-aia-raw-staging
+     語言中心約 434 則，第一次要分 8 次左右才抓完，這段期間 `/health` 會顯示 degraded。
+   - 每個請求間隔 1 秒；只允許登記的列表／內文路徑，內文編號必須符合固定格式（`queryRules`）。
+   - 日期是官網上的台灣日期，存成當天 00:00（UTC+8）。
+-  - **個人資料**：含遮罩姓名名單（例如「高O琁」）的公告不收錄，記在 `quarantined_records`
+-    （原因 `PERSONAL_DATA`），保留原始檔可追溯；不算驗證失敗，也不會每天重抓。
++  - **個人資料**（`src/ingestion/personal-data.ts`）：學生名單類公告不收錄，記在 `quarantined_records`
++    （原因 `PERSONAL_DATA`），保留原始檔可追溯；不算驗證失敗，也不會每天重抓。判斷規則：
++    遮罩姓名（O、○、〇、＊、x 等，排除「二〇二六」這類中文數字）、完整或部分遮罩的學號、
++    標題像名單／結果公告且內文有 10 個以上像姓名的項目。已收錄的公告若重新驗證時被擋下，
++    狀態改為 `withheld`，MCP 不再提供（不刪除）。
++  - 規則更新後要重新檢查已收錄的公告：本機打 `/__scheduled?cron=reverify:lc-announcements`
++    （每次 60 則，重複到 deferred 為 0）。
+ - **一次只跑一個來源**：Cloudflare 對每次執行有 D1 查詢數與子請求數上限。每頁只用 1–2 次讀取
+   加 1 個 batch 寫入；最大的高教深耕（約 20 頁）一次約 90 個 D1 查詢、80 個子請求，語言中心
+   一次約 130 個請求、500 個子請求，**超過 Workers 免費方案的上限，staging/production 需要 Workers Paid**。
+diff --git a/mcp/src/db/canonical-store.ts b/mcp/src/db/canonical-store.ts
+index df409fc..7cb6e77 100644
+--- a/mcp/src/db/canonical-store.ts
++++ b/mcp/src/db/canonical-store.ts
+@@ -259,7 +259,8 @@ export class CanonicalStore {
+       statements.push(
+         this.db
+           .prepare(
+-            `UPDATE entities SET last_seen_run_id = ?1, missing_runs = 0, status = 'active'
++            `UPDATE entities SET last_seen_run_id = ?1, missing_runs = 0,
++               status = CASE WHEN status = 'withheld' THEN status ELSE 'active' END
+              WHERE entity_type = ?2 AND stable_key IN (${entityPlaceholders})`,
+           )
+           .bind(runId, entityType, ...part.map((i) => i.stableKey)),
+@@ -282,6 +283,26 @@ export class CanonicalStore {
+       .run();
+   }
+ 
++  /**
++   * 已收錄、但這次重新驗證時被擋下的資料（例如含個人資料）：狀態改為 withheld，
++   * MCP 不再提供；不刪除，官網連結與原始檔仍可追溯。
++   */
++  async withhold(entityType: string, stableKeys: string[], runId: string, now: string): Promise<number> {
++    let changed = 0;
++    for (const keys of chunk(stableKeys, MAX_IN_PARAMS)) {
++      const placeholders = keys.map((_, i) => `?${i + 4}`).join(", ");
++      const result = await this.db
++        .prepare(
++          `UPDATE entities SET status = 'withheld', last_seen_run_id = ?2, updated_at = ?3
++           WHERE entity_type = ?1 AND stable_key IN (${placeholders}) AND status != 'withheld'`,
++        )
++        .bind(entityType, runId, now, ...keys)
++        .run();
++      changed += result.meta.changes ?? 0;
++    }
++    return changed;
++  }
++
+   async countActive(sourceId: string): Promise<number> {
+     const row = await this.db
+       .prepare(`SELECT COUNT(*) AS n FROM entities WHERE source_id = ?1 AND status = 'active'`)
+diff --git a/mcp/src/db/read-repository.ts b/mcp/src/db/read-repository.ts
+index 865366a..0a3b32c 100644
+--- a/mcp/src/db/read-repository.ts
++++ b/mcp/src/db/read-repository.ts
+@@ -79,7 +79,7 @@ export class ReadRepository {
+     const { results } = await this.db
+       .prepare(
+         `SELECT ${ROW_COLUMNS} FROM entities e JOIN sources s ON s.id = e.source_id
+-         WHERE e.entity_type = ?1 AND e.stable_key IN (${placeholders})
++         WHERE e.entity_type = ?1 AND e.stable_key IN (${placeholders}) AND e.status != 'withheld'
+          ORDER BY e.source_unit`,
+       )
+       .bind(entityType, ...units.map((u) => `${u}:${id}`))
+diff --git a/mcp/src/ingestion/adapters/html-news.ts b/mcp/src/ingestion/adapters/html-news.ts
+index 7991fdc..eed2f67 100644
+--- a/mcp/src/ingestion/adapters/html-news.ts
++++ b/mcp/src/ingestion/adapters/html-news.ts
+@@ -1,5 +1,6 @@
+ import { IngestionError } from "../../shared/errors";
+ import { AnnouncementSchema } from "../../shared/schemas";
++import { personalDataReason } from "../personal-data";
+ import type { HtmlNewsConfig, SourceDefinition } from "../types";
+ import { bodyText, clean, HTML_SITES, taiwanDateToIso, type HtmlSite, type ListItem } from "./html-sites";
+ import type { Adapter, AdapterRecord, KnownRecord, Step, StepOutcome } from "./types";
+@@ -8,20 +9,6 @@ import { decodeUtf8 } from "./types";
+ /** 列表最多翻幾頁（語言中心目前約 73 頁）。 */
+ const MAX_LIST_PAGES = 200;
+ 
+-/**
+- * 遮罩過的姓名（例如「高O琁」「王○明」）。語言中心等單位會公告學生名單，
+- * 即使遮罩仍屬個人資料，MCP 不轉載，改記隔離區、保留官網連結可追溯。
+- */
+-const MASKED_NAME = /[一-鿿][OＯ○◯＊*][一-鿿]/g;
+-
+-export function personalDataReason(title: string, text: string): string | null {
+-  const masked = new Set(`${title}\n${text}`.match(MASKED_NAME) ?? []);
+-  if (masked.size >= 3 || (masked.size >= 1 && /名單/.test(title))) {
+-    return `PERSONAL_DATA: ${masked.size} masked name(s); not republished`;
+-  }
+-  return null;
+-}
+-
+ function stripEllipsis(title: string): string {
+   return title.replace(/(\.{3}|…)$/, "").trim();
+ }
+@@ -45,8 +32,9 @@ export function selectDetails(
+   known: Map<string, KnownRecord>,
+   config: HtmlNewsConfig,
+   nowIso: string,
++  reverifyAll = false,
+ ): { chosen: ListItem[]; deferred: number } {
+-  const staleBefore = Date.parse(nowIso) - config.reverifyAfterSeconds * 1000;
++  const staleBefore = reverifyAll ? Number.POSITIVE_INFINITY : Date.parse(nowIso) - config.reverifyAfterSeconds * 1000;
+   const candidates: Candidate[] = [];
+   for (const item of items) {
+     const k = known.get(item.id);
+@@ -140,7 +128,7 @@ export const htmlNewsAdapter: Adapter = {
+         // 列表走完：決定這次要抓哪些內文。
+         const items = [...listed.values()];
+         const known = await ctx.known(items.map((i) => i.id));
+-        const { chosen, deferred } = selectDetails(items, known, config, ctx.nowIso);
++        const { chosen, deferred } = selectDetails(items, known, config, ctx.nowIso, ctx.reverifyAll);
+         outcome.listComplete = true;
+         outcome.deferred = deferred;
+         outcome.next = chosen.map((item) => detailStep(source, site, config, { ...item, title: clean(item.title) }));
+diff --git a/mcp/src/ingestion/adapters/types.ts b/mcp/src/ingestion/adapters/types.ts
+index 63f3d6f..9c2287c 100644
+--- a/mcp/src/ingestion/adapters/types.ts
++++ b/mcp/src/ingestion/adapters/types.ts
+@@ -27,6 +27,8 @@ export interface KnownRecord {
+ export interface StepContext {
+   source: SourceDefinition;
+   nowIso: string;
++  /** 把所有已知紀錄都當成需要重新驗證。 */
++  reverifyAll?: boolean;
+   /** 依來源編號查已知紀錄。 */
+   known(ids: string[]): Promise<Map<string, KnownRecord>>;
+   activeCount(): Promise<number>;
+diff --git a/mcp/src/ingestion/html-text.ts b/mcp/src/ingestion/html-text.ts
+index c5a1542..34b6549 100644
+--- a/mcp/src/ingestion/html-text.ts
++++ b/mcp/src/ingestion/html-text.ts
+@@ -19,6 +19,32 @@ const NAMED_ENTITIES: Record<string, string> = {
+   rdquo: "”",
+   copy: "©",
+   reg: "®",
++  trade: "™",
++  times: "×",
++  divide: "÷",
++  plusmn: "±",
++  minus: "−",
++  deg: "°",
++  micro: "µ",
++  para: "¶",
++  sect: "§",
++  laquo: "«",
++  raquo: "»",
++  larr: "←",
++  rarr: "→",
++  uarr: "↑",
++  darr: "↓",
++  hearts: "♥",
++  yen: "¥",
++  euro: "€",
++  pound: "£",
++  cent: "¢",
++  frac12: "½",
++  frac14: "¼",
++  frac34: "¾",
++  sup2: "²",
++  sup3: "³",
++  shy: "",
+ };
+ 
+ function decodeEntities(text: string): string {
+diff --git a/mcp/src/ingestion/index.ts b/mcp/src/ingestion/index.ts
+index 637b28a..bd15182 100644
+--- a/mcp/src/ingestion/index.ts
++++ b/mcp/src/ingestion/index.ts
+@@ -31,14 +31,20 @@ export default {
+     };
+     ctx.waitUntil(
+       (async () => {
+-        // 本機測試可用 /__scheduled?cron=source:<來源 id> 指定來源；正式 cron 字串只來自 wrangler 設定。
+-        const requested = controller.cron.startsWith("source:") ? getSource(controller.cron.slice(7)) : undefined;
++        // 本機可用 /__scheduled?cron=source:<來源 id> 指定來源，cron=reverify:<來源 id> 重新驗證全部內文；
++        // 正式環境的 cron 字串只來自 wrangler 設定，無法帶入這兩種值。
++        const [mode, id] = controller.cron.split(":", 2) as [string, string | undefined];
++        const requested = mode === "source" || mode === "reverify" ? getSource(id ?? "") : undefined;
+         const source = requested ?? (await pickDueSource(deps.store, systemClock.nowIso()));
+         if (!source) {
+           console.log(JSON.stringify({ type: "ingestion_idle", reason: "no source due" }));
+           return;
+         }
+-        const summary = await runIngestion(deps, { sourceIds: [source.id], trigger: "scheduled" });
++        const summary = await runIngestion(deps, {
++          sourceIds: [source.id],
++          trigger: "scheduled",
++          reverifyAll: mode === "reverify" && requested !== undefined,
++        });
+         // 每次執行輸出一筆結構化摘要（規格 06 §25），不含回應內容或任何金鑰。
+         console.log(JSON.stringify(summary));
+       })(),
+diff --git a/mcp/src/ingestion/personal-data.ts b/mcp/src/ingestion/personal-data.ts
+new file mode 100644
+index 0000000..2139543
+--- /dev/null
++++ b/mcp/src/ingestion/personal-data.ts
+@@ -0,0 +1,57 @@
++/**
++ * 個人資料偵測：公告內文若是學生名單（遮罩或未遮罩的姓名、學號），MCP 不轉載，
++ * 改記隔離區（原因 PERSONAL_DATA），保留官網連結與原始檔可追溯。
++ * 只用固定規則判斷，不使用模型；寧可多擋，被擋的公告仍可從官網連結查看。
++ */
++
++const CJK = "\\u4e00-\\u9fff";
++/** 遮罩字元：O、全形 Ｏ、○、◯、〇、＊、*、x、X。 */
++const MASKED_NAME = new RegExp(`[${CJK}][OＯ○◯〇＊*xX][${CJK}]`, "g");
++/** 「二〇二六」這類中文數字裡的〇不是遮罩。 */
++const CHINESE_NUMERAL = /^[〇零一二三四五六七八九十百千]$/;
++/** 完整學號（本校為 9 碼、以 3 或 4 開頭）。 */
++const FULL_STUDENT_ID = /(?<!\d)[34]\d{8}(?!\d)/g;
++/** 部分遮罩學號，例如 4xx***xxx、41234****。 */
++const MASKED_STUDENT_ID = /(?<![\dA-Za-z])[34][\dxX]{1,5}[*＊]{2,}[\dxX]*(?![\dA-Za-z])/g;
++/** 標題像名單或結果公告。 */
++const LIST_TITLE = /名單|獲獎|得獎|得主|合格|錄取|錄取|抽獎|中獎|結果|榜單|獎勵/;
++
++/** 常見姓氏（約涵蓋台灣九成以上人口）。 */
++const SURNAMES = new Set(
++  (
++    "陳林黃張李王吳劉蔡楊許鄭謝洪郭邱曾廖賴徐周葉蘇莊呂江何蕭羅高潘簡朱鍾游彭詹胡施沈余盧梁趙顏柯翁魏孫戴范方宋鄧杜傅侯曹薛丁卓阮馬董温溫唐藍蔣石古紀姚連馮歐程湯黃田康姜白汪鄒尤巫鐘黎涂龔嚴韓袁金童陸夏柳凃邵錢伍倪溫于譚駱熊任甘秦顧毛章史官萬俞雷粘饒張"
++  ).split(""),
++);
++
++function maskedNames(text: string): number {
++  const found = new Set<string>();
++  for (const m of text.matchAll(MASKED_NAME)) {
++    const [a, mask, b] = [...m[0]];
++    if (mask === "〇" && (CHINESE_NUMERAL.test(a!) || CHINESE_NUMERAL.test(b!))) continue;
++    found.add(m[0]);
++  }
++  return found.size;
++}
++
++/** 名單常見的排法：姓名之間以空白、Tab、換行或頓號分隔，每個姓名 2–3 個字、以常見姓氏開頭。 */
++function plainNames(text: string): number {
++  const tokens = text.split(/[\s、，,；;／/（）()]+/);
++  const names = new Set<string>();
++  for (const t of tokens) {
++    if (new RegExp(`^[${CJK}]{2,3}$`).test(t) && SURNAMES.has(t[0]!)) names.add(t);
++  }
++  return names.size;
++}
++
++export function personalDataReason(title: string, text: string): string | null {
++  const all = `${title}\n${text}`;
++  const masked = maskedNames(all);
++  const ids = new Set([...(all.match(FULL_STUDENT_ID) ?? []), ...(all.match(MASKED_STUDENT_ID) ?? [])]).size;
++  const listTitle = LIST_TITLE.test(title);
++  const plain = listTitle ? plainNames(text) : 0;
++  const hits: string[] = [];
++  if (masked >= 3 || (masked >= 1 && listTitle)) hits.push(`${masked} masked name(s)`);
++  if (ids >= 3) hits.push(`${ids} student id(s)`);
++  if (plain >= 10) hits.push(`${plain} name-like entries under a list title`);
++  return hits.length ? `PERSONAL_DATA: ${hits.join(", ")}; not republished` : null;
++}
+diff --git a/mcp/src/ingestion/run-ingestion.ts b/mcp/src/ingestion/run-ingestion.ts
+index df9f1c0..f27c6e3 100644
+--- a/mcp/src/ingestion/run-ingestion.ts
++++ b/mcp/src/ingestion/run-ingestion.ts
+@@ -31,6 +31,8 @@ export interface IngestionDeps {
+ 
+ export interface IngestionRunOptions {
+   sourceIds?: string[];
++  /** 重新驗證所有已收錄的內文（例如過濾規則更新後），仍受每次上限限制、分批完成。 */
++  reverifyAll?: boolean;
+   trigger?: "scheduled" | "manual" | "test";
+ }
+ 
+@@ -70,7 +72,12 @@ interface SourceResult {
+ 
+ const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+ 
+-async function ingestSource(source: SourceDefinition, runId: string, deps: IngestionDeps): Promise<SourceResult> {
++async function ingestSource(
++  source: SourceDefinition,
++  runId: string,
++  deps: IngestionDeps,
++  reverifyAll = false,
++): Promise<SourceResult> {
+   const { store, clock } = deps;
+   const sleep = deps.sleep ?? realSleep;
+   const result: SourceResult = {
+@@ -91,6 +98,7 @@ async function ingestSource(source: SourceDefinition, runId: string, deps: Inges
+   const ctx: StepContext = {
+     source,
+     nowIso: clock.nowIso(),
++    reverifyAll,
+     activeCount: () => store.countActive(source.id),
+     async known(ids) {
+       const map = new Map<string, KnownRecord>();
+@@ -176,6 +184,13 @@ async function ingestSource(source: SourceDefinition, runId: string, deps: Inges
+         runId,
+         clock.nowIso(),
+       );
++      // 之前已收錄、這次被擋下的資料：不再提供（例如規則更新後才發現含個人資料）。
++      await store.withhold(
++        source.entityType,
++        outcome.rejected.map((r) => recordKey(source, r.id)),
++        runId,
++        clock.nowIso(),
++      );
+       item.quarantined = outcome.rejected.length;
+       result.quarantined += outcome.rejected.length;
+ 
+@@ -335,7 +350,7 @@ export async function runIngestion(
+   // 來源之間互不影響；排程每次只跑一個來源，依序執行即為有界的並行度。
+   for (const source of sources) {
+     try {
+-      const r = await ingestSource(source, runId, deps);
++      const r = await ingestSource(source, runId, deps, options.reverifyAll ?? false);
+       totals.fetched += r.fetched;
+       totals.published += r.published;
+       totals.unchanged += r.unchanged;
+diff --git a/mcp/tests/integration/html-sources.test.ts b/mcp/tests/integration/html-sources.test.ts
+index 1b9ddb5..665737c 100644
+--- a/mcp/tests/integration/html-sources.test.ts
++++ b/mcp/tests/integration/html-sources.test.ts
+@@ -187,6 +187,29 @@ describe("lc.ntpu.edu.tw", () => {
+     expect(db.count("quarantined_records")).toBe(1);
+   });
+ 
++  it("an announcement that later turns out to list students is withheld, not served", async () => {
++    sites.lc = [lcNews(1), lcNews(2, { title: "獎勵結果公告" })];
++    await runLc();
++    expect(entity(`lc:${lcId(2)}`)!.status).toBe("active");
++
++    // 過濾規則更新或官網補上名單後，重新驗證時被擋下：狀態改為 withheld，查不到。
++    sites.lc[1] = lcNews(2, { title: "獎勵結果公告", body: "<p>王〇明 李〇華 陳〇安</p>" });
++    clock.advance(3600);
++    const summary = await runIngestion(deps, { sourceIds: ["lc-announcements"], trigger: "test", reverifyAll: true });
++    expect(summary).toMatchObject({ fetched: 3, quarantined: 1 });
++    expect(entity(`lc:${lcId(2)}`)!.status).toBe("withheld");
++    expect(entity(`lc:${lcId(1)}`)!.status).toBe("active");
++
++    // 之後每天走列表時不會又被標回 active。
++    clock.advance(86_400);
++    await runLc();
++    expect(entity(`lc:${lcId(2)}`)!.status).toBe("withheld");
++    const { ReadRepository } = await import("../../src/db/read-repository");
++    const repo = new ReadRepository(db.asD1());
++    expect(await repo.getAnnouncementRows(lcId(2), ["lc"])).toEqual([]);
++    expect((await repo.searchAnnouncements({ keywords: ["獎勵"], limit: 10 })).length).toBe(0);
++  });
++
+   it("dates are Taiwan calendar dates", async () => {
+     sites.lc = [lcNews(1, { date: "2026-10-03" })];
+     await runLc();
+diff --git a/mcp/tests/unit/personal-data.test.ts b/mcp/tests/unit/personal-data.test.ts
+new file mode 100644
+index 0000000..4bdd0d2
+--- /dev/null
++++ b/mcp/tests/unit/personal-data.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from "vitest";
++import { personalDataReason } from "../../src/ingestion/personal-data";
++
++describe("personal data guard", () => {
++  it.each([
++    ["masked with O", "合格名單", "高O琁"],
++    ["masked with 〇", "英語能力檢定獎勵結果公告", "王〇明\t李〇華\t陳〇安"],
++    ["masked with ○ and no list title", "國際志工培訓招募", "錄取：林○宇、張○婷、黃○誠"],
++    ["masked with x", "抽獎結果", "吳x豪 周x妤 蔡x勳"],
++    ["full student ids", "問卷抽獎結果", "411234567 412345678 410987654"],
++    ["partly masked student ids", "獲獎名單", "4xx***123\n41234****\n4101***88"],
++    [
++      "unmasked names under a list title",
++      "EMI/ESAP教學助理合格名單",
++      "陳怡君 林家豪 黃志明 張雅婷 李宗翰 王淑芬 吳承恩 劉建宏 蔡佳穎 楊子儀 許文彬",
++    ],
++  ])("blocks %s", (_name, title, text) => {
++    expect(personalDataReason(title, text)).toMatch(/^PERSONAL_DATA/);
++  });
++
++  it.each([
++    ["Chinese-numeral years", "活動公告", "二〇二六年三月舉辦，二〇二五年成果展。"],
++    ["ordinary announcements", "英文健診預約名單", "請至英文健診系統查詢預約時段，名單請見附件圖片。"],
++    ["name-like words without a list title", "課程介紹", "陳列 林園 黃金 張貼 李子 王牌 吳郭魚 劉海 蔡倫 楊柳 許多 高等"],
++    ["phone numbers and dates", "多益校園考報名", "電話 02-86741111 分機 66701，日期 2026/10/03。"],
++  ])("does not block %s", (_name, title, text) => {
++    expect(personalDataReason(title, text)).toBeNull();
++  });
++});
+-- 
+2.43.0
+
