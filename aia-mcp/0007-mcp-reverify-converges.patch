@@ -1,0 +1,236 @@
+From a6edf244ab78199f782904dcdb81b45b9913977c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 10:30:45 +0000
+Subject: [PATCH] fix(mcp): let a forced re-verification finish
+
+Re-verifying with no cutoff kept every record a candidate, so deferred
+never dropped below the per-run cap, and withheld rows were picked
+again each run because their verified_at stayed old. A re-verification
+now takes a cutoff time: only records verified before it are fetched,
+withholding a record stamps verified_at, and repeated runs with the
+same cutoff converge to deferred 0.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ mcp/README.md                              |  5 ++--
+ mcp/src/db/canonical-store.ts              |  8 +++---
+ mcp/src/ingestion/adapters/html-news.ts    | 10 +++++---
+ mcp/src/ingestion/adapters/types.ts        |  4 +--
+ mcp/src/ingestion/index.ts                 | 12 ++++++---
+ mcp/src/ingestion/run-ingestion.ts         | 13 ++++++----
+ mcp/tests/integration/html-sources.test.ts | 29 +++++++++++++++++++++-
+ 7 files changed, 62 insertions(+), 19 deletions(-)
+
+diff --git a/mcp/README.md b/mcp/README.md
+index 89d98c3..6b0f8cd 100644
+--- a/mcp/README.md
++++ b/mcp/README.md
+@@ -115,8 +115,9 @@ npx wrangler r2 bucket create ntpu-aia-raw-staging
+     遮罩姓名（O、○、〇、＊、x 等，排除「二〇二六」這類中文數字）、完整或部分遮罩的學號、
+     標題像名單／結果公告且內文有 10 個以上像姓名的項目。已收錄的公告若重新驗證時被擋下，
+     狀態改為 `withheld`，MCP 不再提供（不刪除）。
+-  - 規則更新後要重新檢查已收錄的公告：本機打 `/__scheduled?cron=reverify:lc-announcements`
+-    （每次 60 則，重複到 deferred 為 0）。
++  - 規則更新後要重新檢查已收錄的公告：本機打
++    `/__scheduled?cron=reverify:lc-announcements:<規則更新的 UTC 時間，例如 2026-10-03T10:25:00Z>`，
++    每次 60 則，用同一個時間重複執行到 deferred 為 0。
+ - **一次只跑一個來源**：Cloudflare 對每次執行有 D1 查詢數與子請求數上限。每頁只用 1–2 次讀取
+   加 1 個 batch 寫入；最大的高教深耕（約 20 頁）一次約 90 個 D1 查詢、80 個子請求，語言中心
+   一次約 130 個請求、500 個子請求，**超過 Workers 免費方案的上限，staging/production 需要 Workers Paid**。
+diff --git a/mcp/src/db/canonical-store.ts b/mcp/src/db/canonical-store.ts
+index 7cb6e77..ae75296 100644
+--- a/mcp/src/db/canonical-store.ts
++++ b/mcp/src/db/canonical-store.ts
+@@ -285,7 +285,8 @@ export class CanonicalStore {
+ 
+   /**
+    * 已收錄、但這次重新驗證時被擋下的資料（例如含個人資料）：狀態改為 withheld，
+-   * MCP 不再提供；不刪除，官網連結與原始檔仍可追溯。
++   * MCP 不再提供；不刪除，官網連結與原始檔仍可追溯。verified_at 記這次的檢查時間，
++   * 避免同一筆在重新驗證時一直被挑到。
+    */
+   async withhold(entityType: string, stableKeys: string[], runId: string, now: string): Promise<number> {
+     let changed = 0;
+@@ -293,8 +294,9 @@ export class CanonicalStore {
+       const placeholders = keys.map((_, i) => `?${i + 4}`).join(", ");
+       const result = await this.db
+         .prepare(
+-          `UPDATE entities SET status = 'withheld', last_seen_run_id = ?2, updated_at = ?3
+-           WHERE entity_type = ?1 AND stable_key IN (${placeholders}) AND status != 'withheld'`,
++          `UPDATE entities SET status = 'withheld', last_seen_run_id = ?2, verified_at = ?3,
++             updated_at = CASE WHEN status = 'withheld' THEN updated_at ELSE ?3 END
++           WHERE entity_type = ?1 AND stable_key IN (${placeholders})`,
+         )
+         .bind(entityType, runId, now, ...keys)
+         .run();
+diff --git a/mcp/src/ingestion/adapters/html-news.ts b/mcp/src/ingestion/adapters/html-news.ts
+index eed2f67..e994879 100644
+--- a/mcp/src/ingestion/adapters/html-news.ts
++++ b/mcp/src/ingestion/adapters/html-news.ts
+@@ -32,9 +32,13 @@ export function selectDetails(
+   known: Map<string, KnownRecord>,
+   config: HtmlNewsConfig,
+   nowIso: string,
+-  reverifyAll = false,
++  reverifyBefore?: string,
+ ): { chosen: ListItem[]; deferred: number } {
+-  const staleBefore = reverifyAll ? Number.POSITIVE_INFINITY : Date.parse(nowIso) - config.reverifyAfterSeconds * 1000;
++  // 一般情況：超過 reverifyAfterSeconds 沒驗證的才重抓。指定 reverifyBefore 時，
++  // 在那之前驗證過的也重抓；分批執行時，已重新驗證過的不會再被挑到，留到下一次的數量會逐次減少。
++  const normal = Date.parse(nowIso) - config.reverifyAfterSeconds * 1000;
++  const forced = reverifyBefore ? Date.parse(reverifyBefore) : Number.NEGATIVE_INFINITY;
++  const staleBefore = Math.max(normal, Number.isNaN(forced) ? Number.NEGATIVE_INFINITY : forced);
+   const candidates: Candidate[] = [];
+   for (const item of items) {
+     const k = known.get(item.id);
+@@ -128,7 +132,7 @@ export const htmlNewsAdapter: Adapter = {
+         // 列表走完：決定這次要抓哪些內文。
+         const items = [...listed.values()];
+         const known = await ctx.known(items.map((i) => i.id));
+-        const { chosen, deferred } = selectDetails(items, known, config, ctx.nowIso, ctx.reverifyAll);
++        const { chosen, deferred } = selectDetails(items, known, config, ctx.nowIso, ctx.reverifyBefore);
+         outcome.listComplete = true;
+         outcome.deferred = deferred;
+         outcome.next = chosen.map((item) => detailStep(source, site, config, { ...item, title: clean(item.title) }));
+diff --git a/mcp/src/ingestion/adapters/types.ts b/mcp/src/ingestion/adapters/types.ts
+index 9c2287c..e02e4fe 100644
+--- a/mcp/src/ingestion/adapters/types.ts
++++ b/mcp/src/ingestion/adapters/types.ts
+@@ -27,8 +27,8 @@ export interface KnownRecord {
+ export interface StepContext {
+   source: SourceDefinition;
+   nowIso: string;
+-  /** 把所有已知紀錄都當成需要重新驗證。 */
+-  reverifyAll?: boolean;
++  /** 在這個時間之前驗證過的紀錄都要重新驗證（ISO 時間）。 */
++  reverifyBefore?: string;
+   /** 依來源編號查已知紀錄。 */
+   known(ids: string[]): Promise<Map<string, KnownRecord>>;
+   activeCount(): Promise<number>;
+diff --git a/mcp/src/ingestion/index.ts b/mcp/src/ingestion/index.ts
+index bd15182..28b5fd3 100644
+--- a/mcp/src/ingestion/index.ts
++++ b/mcp/src/ingestion/index.ts
+@@ -31,9 +31,15 @@ export default {
+     };
+     ctx.waitUntil(
+       (async () => {
+-        // 本機可用 /__scheduled?cron=source:<來源 id> 指定來源，cron=reverify:<來源 id> 重新驗證全部內文；
++        // 本機可用 /__scheduled?cron=source:<來源 id> 指定來源；
++        // cron=reverify:<來源 id>:<ISO 時間> 重新驗證在那之前驗證過的內文（重複執行到 deferred 為 0）。
+         // 正式環境的 cron 字串只來自 wrangler 設定，無法帶入這兩種值。
+-        const [mode, id] = controller.cron.split(":", 2) as [string, string | undefined];
++        const [mode, id, ...rest] = controller.cron.split(":") as [string, string | undefined, ...string[]];
++        const reverifyBefore = mode === "reverify" ? rest.join(":") : "";
++        if (mode === "reverify" && Number.isNaN(Date.parse(reverifyBefore))) {
++          console.error(JSON.stringify({ type: "ingestion_error", reason: "reverify needs an ISO time" }));
++          return;
++        }
+         const requested = mode === "source" || mode === "reverify" ? getSource(id ?? "") : undefined;
+         const source = requested ?? (await pickDueSource(deps.store, systemClock.nowIso()));
+         if (!source) {
+@@ -43,7 +49,7 @@ export default {
+         const summary = await runIngestion(deps, {
+           sourceIds: [source.id],
+           trigger: "scheduled",
+-          reverifyAll: mode === "reverify" && requested !== undefined,
++          reverifyBefore: mode === "reverify" && requested !== undefined ? reverifyBefore : undefined,
+         });
+         // 每次執行輸出一筆結構化摘要（規格 06 §25），不含回應內容或任何金鑰。
+         console.log(JSON.stringify(summary));
+diff --git a/mcp/src/ingestion/run-ingestion.ts b/mcp/src/ingestion/run-ingestion.ts
+index f27c6e3..c3d5402 100644
+--- a/mcp/src/ingestion/run-ingestion.ts
++++ b/mcp/src/ingestion/run-ingestion.ts
+@@ -31,8 +31,11 @@ export interface IngestionDeps {
+ 
+ export interface IngestionRunOptions {
+   sourceIds?: string[];
+-  /** 重新驗證所有已收錄的內文（例如過濾規則更新後），仍受每次上限限制、分批完成。 */
+-  reverifyAll?: boolean;
++  /**
++   * 重新驗證在這個時間之前驗證過的所有內文（例如過濾規則更新後，填規則更新的時間）。
++   * 仍受每次上限限制，分批完成；同一個時間重複執行，直到 deferred 為 0。
++   */
++  reverifyBefore?: string;
+   trigger?: "scheduled" | "manual" | "test";
+ }
+ 
+@@ -76,7 +79,7 @@ async function ingestSource(
+   source: SourceDefinition,
+   runId: string,
+   deps: IngestionDeps,
+-  reverifyAll = false,
++  reverifyBefore?: string,
+ ): Promise<SourceResult> {
+   const { store, clock } = deps;
+   const sleep = deps.sleep ?? realSleep;
+@@ -98,7 +101,7 @@ async function ingestSource(
+   const ctx: StepContext = {
+     source,
+     nowIso: clock.nowIso(),
+-    reverifyAll,
++    reverifyBefore,
+     activeCount: () => store.countActive(source.id),
+     async known(ids) {
+       const map = new Map<string, KnownRecord>();
+@@ -350,7 +353,7 @@ export async function runIngestion(
+   // 來源之間互不影響；排程每次只跑一個來源，依序執行即為有界的並行度。
+   for (const source of sources) {
+     try {
+-      const r = await ingestSource(source, runId, deps, options.reverifyAll ?? false);
++      const r = await ingestSource(source, runId, deps, options.reverifyBefore);
+       totals.fetched += r.fetched;
+       totals.published += r.published;
+       totals.unchanged += r.unchanged;
+diff --git a/mcp/tests/integration/html-sources.test.ts b/mcp/tests/integration/html-sources.test.ts
+index 665737c..9414a77 100644
+--- a/mcp/tests/integration/html-sources.test.ts
++++ b/mcp/tests/integration/html-sources.test.ts
+@@ -195,7 +195,11 @@ describe("lc.ntpu.edu.tw", () => {
+     // 過濾規則更新或官網補上名單後，重新驗證時被擋下：狀態改為 withheld，查不到。
+     sites.lc[1] = lcNews(2, { title: "獎勵結果公告", body: "<p>王〇明 李〇華 陳〇安</p>" });
+     clock.advance(3600);
+-    const summary = await runIngestion(deps, { sourceIds: ["lc-announcements"], trigger: "test", reverifyAll: true });
++    const summary = await runIngestion(deps, {
++      sourceIds: ["lc-announcements"],
++      trigger: "test",
++      reverifyBefore: clock.nowIso(),
++    });
+     expect(summary).toMatchObject({ fetched: 3, quarantined: 1 });
+     expect(entity(`lc:${lcId(2)}`)!.status).toBe("withheld");
+     expect(entity(`lc:${lcId(1)}`)!.status).toBe("active");
+@@ -210,6 +214,29 @@ describe("lc.ntpu.edu.tw", () => {
+     expect((await repo.searchAnnouncements({ keywords: ["獎勵"], limit: 10 })).length).toBe(0);
+   });
+ 
++  it("a forced re-verification finishes in batches without picking the same records again", async () => {
++    sites.lc = Array.from({ length: 70 }, (_, i) => lcNews(i + 1));
++    sites.lc[3] = lcNews(4, { body: "<p>王〇明 李〇華 陳〇安</p>" });
++    await runLc();
++    await runLc();
++    clock.advance(3600);
++    const cutoff = clock.nowIso();
++    const deferred: number[] = [];
++    for (let i = 0; i < 4; i++) {
++      clock.advance(60);
++      const r = await runIngestion(deps, { sourceIds: ["lc-announcements"], trigger: "test", reverifyBefore: cutoff });
++      deferred.push(r.deferred);
++      if (r.deferred === 0) break;
++    }
++    // 69 筆已收錄 + 1 筆在隔離區：第一次 60 筆，第二次剩下的 10 筆，之後不再重抓。
++    expect(deferred).toEqual([10, 0]);
++    sites.requests = [];
++    clock.advance(60);
++    const again = await runIngestion(deps, { sourceIds: ["lc-announcements"], trigger: "test", reverifyBefore: cutoff });
++    expect(again).toMatchObject({ status: "success", deferred: 0 });
++    expect(sites.requests.some((r) => r.includes("news_in.jsp"))).toBe(false);
++  });
++
+   it("dates are Taiwan calendar dates", async () => {
+     sites.lc = [lcNews(1, { date: "2026-10-03" })];
+     await runLc();
+-- 
+2.43.0
+
