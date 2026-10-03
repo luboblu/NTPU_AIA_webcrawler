@@ -1,0 +1,151 @@
+From 6fc39ae81c76acea8f5141a4ef284e33df2ff02a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 09:36:08 +0000
+Subject: [PATCH] fix(mcp): link sustainable announcements to esdg.ntpu.edu.tw
+
+new.ntpu.edu.tw/sustainable/news/<id> shows a not-found page; the
+office publishes the same Strapi records at esdg.ntpu.edu.tw/news/<id>.
+Each source now declares its public news URL base, validated as an
+https ntpu.edu.tw URL. Existing rows get the corrected link as a new
+version on their next run, so the old link stays in history.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FCgoUnzqQSfKjvqShB2hjh
+---
+ .../normalizers/announcement.normalizer.ts    |  3 +--
+ mcp/src/ingestion/source-registry.ts          | 23 +++++++++++++++----
+ mcp/src/ingestion/types.ts                    |  2 ++
+ mcp/src/ingestion/url-policy.ts               | 10 ++++++++
+ mcp/tests/integration/multi-office.test.ts    | 10 ++++++++
+ 5 files changed, 41 insertions(+), 7 deletions(-)
+
+diff --git a/mcp/src/ingestion/normalizers/announcement.normalizer.ts b/mcp/src/ingestion/normalizers/announcement.normalizer.ts
+index 5bb14be..b204c1b 100644
+--- a/mcp/src/ingestion/normalizers/announcement.normalizer.ts
++++ b/mcp/src/ingestion/normalizers/announcement.normalizer.ts
+@@ -5,7 +5,6 @@ import type { StrapiPublication } from "../parsers/strapi-publications.parser";
+ import type { SourceDefinition } from "../types";
+ 
+ const CMS_ORIGIN = "https://cms-carrier.ntpu.edu.tw";
+-const SITE_ORIGIN = "https://new.ntpu.edu.tw";
+ 
+ function absoluteFileUrl(raw: string): string {
+   const url = new URL(raw.trim(), `${CMS_ORIGIN}/`);
+@@ -55,7 +54,7 @@ export function normalizeAnnouncement(item: StrapiPublication, source: SourceDef
+     publishedAt,
+     bodyText: htmlToText(typeof item.content === "string" ? item.content : ""),
+     attachments,
+-    sourceUrl: `${SITE_ORIGIN}/${source.sourceUnit}/news/${id}`,
++    sourceUrl: `${source.newsUrlBase}/${id}`,
+   };
+   const parsed = AnnouncementSchema.safeParse(candidate);
+   if (!parsed.success) {
+diff --git a/mcp/src/ingestion/source-registry.ts b/mcp/src/ingestion/source-registry.ts
+index 2a2763a..e168742 100644
+--- a/mcp/src/ingestion/source-registry.ts
++++ b/mcp/src/ingestion/source-registry.ts
+@@ -16,7 +16,13 @@ const STRAPI_FETCH = {
+  * site key 是學校 Strapi 的 sitesApproved 值。校長室、三位副校長室只有內容頁；
+  * 圖書館與語言中心用自己的網站，這些都不是這種來源，沒有列入。
+  */
+-export const ANNOUNCEMENT_UNITS = [
++export const ANNOUNCEMENT_UNITS: readonly {
++  unit: string;
++  name: string;
++  siteKey: string;
++  /** 公告不在 new.ntpu.edu.tw/{unit}/news 時，填實際公開頁面的前綴。 */
++  newsUrlBase?: string;
++}[] = [
+   { unit: "ord", name: "研究發展處", siteKey: "ord_ntpu" },
+   { unit: "oga", name: "總務處", siteKey: "oga_ntpu" },
+   { unit: "osa", name: "學生事務處", siteKey: "osa_ntpu" },
+@@ -28,22 +34,29 @@ export const ANNOUNCEMENT_UNITS = [
+   { unit: "alumni", name: "校友服務中心", siteKey: "alumni_ntpu" },
+   { unit: "edusp", name: "高教深耕計畫辦公室", siteKey: "edusp_ntpu" },
+   { unit: "os", name: "秘書室", siteKey: "os_ntpu" },
+-  { unit: "sustainable", name: "永續發展辦公室", siteKey: "sustainable_ntpu" },
++  // 永續辦公室的公告顯示在自己的網站（new.ntpu.edu.tw/sustainable/news 會顯示「找不到」），2026-10-03 確認。
++  {
++    unit: "sustainable",
++    name: "永續發展辦公室",
++    siteKey: "sustainable_ntpu",
++    newsUrlBase: "https://esdg.ntpu.edu.tw/news",
++  },
+   { unit: "ope", name: "體育室", siteKey: "ope_ntpu" },
+   { unit: "cge", name: "通識教育中心", siteKey: "cge_ntpu" },
+   { unit: "op", name: "人事室", siteKey: "op_ntpu" },
+-] as const;
++];
+ 
+ /**
+  * 所有允許抓取的來源都在這裡宣告（規格 06 §6）。新增來源前需確認資料擁有者、
+  * 是否公開、是否需要登入；需要 gm 登入的頁面不得加入。
+  */
+-export const SOURCES: readonly SourceDefinition[] = ANNOUNCEMENT_UNITS.map(({ unit, siteKey }) => ({
++export const SOURCES: readonly SourceDefinition[] = ANNOUNCEMENT_UNITS.map(({ unit, siteKey, newsUrlBase }) => ({
+   id: `${unit}-announcements`,
+   sourceUnit: unit,
+   sourceType: "official_api",
+   trustLevel: "official",
+-  homepageUrl: `https://new.ntpu.edu.tw/${unit}/news`,
++  homepageUrl: newsUrlBase ?? `https://new.ntpu.edu.tw/${unit}/news`,
++  newsUrlBase: newsUrlBase ?? `https://new.ntpu.edu.tw/${unit}/news`,
+   origin: "https://api-carrier.ntpu.edu.tw",
+   allowedPathPrefixes: ["/strapi"],
+   entrypoints: ["/strapi"],
+diff --git a/mcp/src/ingestion/types.ts b/mcp/src/ingestion/types.ts
+index e72bf32..4d29974 100644
+--- a/mcp/src/ingestion/types.ts
++++ b/mcp/src/ingestion/types.ts
+@@ -18,6 +18,8 @@ export interface SourceDefinition {
+   trustLevel: "official" | "verified" | "secondary";
+   /** 給人看的官方頁面，provenance 與 sources 表使用。 */
+   homepageUrl: string;
++  /** 公告的公開頁面前綴；每則公告的官方連結是「前綴/_id」。 */
++  newsUrlBase: string;
+ 
+   origin: string;
+   allowedPathPrefixes: string[];
+diff --git a/mcp/src/ingestion/url-policy.ts b/mcp/src/ingestion/url-policy.ts
+index 2351857..4e17cfb 100644
+--- a/mcp/src/ingestion/url-policy.ts
++++ b/mcp/src/ingestion/url-policy.ts
+@@ -130,4 +130,14 @@ export function validateSourceDefinition(source: SourceDefinition): void {
+   } catch {
+     fail("homepageUrl is not a URL");
+   }
++  // 公告連結會原樣回給使用者，只允許學校網域的 https 網址。
++  let news: URL | null = null;
++  try {
++    news = new URL(source.newsUrlBase);
++  } catch {
++    fail("newsUrlBase is not a URL");
++  }
++  if (news!.protocol !== "https:" || !news!.hostname.endsWith(".ntpu.edu.tw") || source.newsUrlBase.endsWith("/")) {
++    fail("newsUrlBase must be an https ntpu.edu.tw URL without a trailing slash");
++  }
+ }
+diff --git a/mcp/tests/integration/multi-office.test.ts b/mcp/tests/integration/multi-office.test.ts
+index 9cce10d..2082370 100644
+--- a/mcp/tests/integration/multi-office.test.ts
++++ b/mcp/tests/integration/multi-office.test.ts
+@@ -65,6 +65,16 @@ describe("all offices", () => {
+     expect(statuses.map((r) => r.status)).toEqual(["active", "inactive"]);
+   });
+ 
++  it("offices whose announcements live on their own site link there (sustainable → esdg)", async () => {
++    deps.fetch = new FakeStrapi([], { sustainable_ntpu: [publication(5)] }).fetch;
++    await runIngestion(deps, { sourceIds: ["sustainable-announcements"], trigger: "test" });
++    const [row] = db.rows<{ source_url: string }>("SELECT source_url FROM entities");
++    expect(row!.source_url).toBe(`https://esdg.ntpu.edu.tw/news/${publication(5)._id}`);
++    for (const source of enabledSources()) {
++      expect(source.newsUrlBase).toMatch(/^https:\/\/[a-z]+\.ntpu\.edu\.tw\/[a-z/]+[^/]$/);
++    }
++  });
++
+   it("an office with no announcements completes successfully with zero records", async () => {
+     const summary = await runIngestion(deps, { sourceIds: ["cic-announcements"], trigger: "test" });
+     expect(summary).toMatchObject({ status: "success", fetched: 1, published: 0, failed: 0 });
+-- 
+2.43.0
+
